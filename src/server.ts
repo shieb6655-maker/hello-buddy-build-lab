@@ -2,6 +2,7 @@ import "./lib/error-capture";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
+import { handleFanCodeRequest } from "./lib/fancode-proxy";
 
 type ServerEntry = {
   fetch: (request: Request, env: unknown, ctx: unknown) => Promise<Response> | Response;
@@ -44,9 +45,17 @@ function isH3SwallowedErrorBody(body: string): boolean {
   }
 }
 
+// Hosting compresses every response at the edge. Never compress a body (gzip, brotli,
+// CompressionStream) or set content-encoding here or in a server route: the body gets encoded
+// twice and renders garbled.
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
     try {
+      const proxyResponse = await handleFanCodeRequest(request, env, ctx);
+      if (proxyResponse) {
+        return proxyResponse;
+      }
+
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
       return await normalizeCatastrophicSsrResponse(response);

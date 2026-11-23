@@ -1,14 +1,12 @@
-# Hello Buddy Build Lab
+# Hello There
 
-hi
+Hi
 
 This project was built with [Lovable](https://lovable.dev).
 
-**Live app**: https://hello-buddy-build-lab.lovable.app
-
 ## Build with Lovable
 
-Continue developing this project in the [Lovable editor](https://lovable.dev/projects/cfd84a53-2f52-4501-8846-dfac53f85574).
+Continue developing this project in the [Lovable editor](https://lovable.dev/projects/24665702-316c-4de1-a045-dfebd6cc66c2).
 
 - **Ship faster**: describe what you want to build and Lovable handles the code.
 - **Stay in sync**: every change made in Lovable is committed straight to this repository.
