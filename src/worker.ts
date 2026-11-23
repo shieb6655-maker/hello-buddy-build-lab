@@ -10,7 +10,7 @@ export default {
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
     if (path === "/" || path === "") {
-      return new Response(USAGE_DOC, {
+      return new Response("PLUGX FC API IS ONLINE", {
         headers: { "Content-Type": "text/plain; charset=utf-8", ...CORS_HEADERS },
       });
     }

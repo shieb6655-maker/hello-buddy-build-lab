@@ -194,7 +194,7 @@ export async function fetchUpstreamPlaylist(forceRefresh = false): Promise<{ tex
   }
 
   const res = await fetchWithRetry(UPSTREAM_PLAYLIST, {
-    headers: { "User-Agent": FANCODE_HEADERS["User-Agent"]! },
+    headers: { ...FANCODE_HEADERS },
     // Cloudflare edge cache hint if supported
     // @ts-expect-error CF specific fetch option
     cf: { cacheTtl: 60, cacheEverything: true },
@@ -452,10 +452,10 @@ export async function serveEventsJson(workerUrl: URL): Promise<Response> {
 // ─── Main Dispatcher ─────────────────────────────────────────────────────────
 
 export const USAGE_DOC = `
-FanCode Stream Proxy — TypeScript Edition
-=========================================
+PLUGX FC API IS ONLINE
+======================
 
-Master playlist (all events, clean URLs):
+Master playlist:
   GET /playlist.m3u8
 
 Per-event HLS master:
@@ -466,11 +466,8 @@ Variant playlist:
   GET /fancode/<event-id>/1080p.m3u8
   GET /fancode/<event-id>/720p.m3u8
 
-Segment (proxied with FanCode headers):
+Segment proxy:
   GET /fancode/<event-id>/seg/<encoded>
-
-API endpoints:
-  GET /api/fancode/events  → JSON list of live streams
 `.trim();
 
 /**
