@@ -29,7 +29,6 @@ interface FanCodeEventItem {
   cdnUrl: string;
   name: string;
   logo?: string;
-  proxyLogo?: string;
   category?: string;
   streamUrl?: string;
 }
@@ -254,7 +253,7 @@ function FanCodeDashboard() {
                   controls
                   playsInline
                   className="h-full w-full object-contain"
-                  poster={activeEvent.proxyLogo || activeEvent.logo}
+                  poster={activeEvent.logo}
                 />
                 <button
                   onClick={() => setActiveEvent(null)}
@@ -434,7 +433,7 @@ function FanCodeDashboard() {
                       {item.logo && (
                         <div className="flex items-center gap-2 pt-1">
                           <img
-                            src={item.proxyLogo || item.logo}
+                            src={item.logo}
                             alt=""
                             className="h-6 w-auto max-w-[80px] object-contain opacity-80"
                             onError={(e) => {
@@ -507,7 +506,6 @@ function FanCodeDashboard() {
                     <p className="text-emerald-400">GET /fancode/:slug/playlist.m3u8 <span className="text-slate-500 font-sans">— Rewritten HLS master for specific match</span></p>
                     <p className="text-emerald-400">GET /fancode/:slug/:quality.m3u8 <span className="text-slate-500 font-sans">— Variant quality playlist (1080p, 720p)</span></p>
                     <p className="text-emerald-400">GET /fancode/:slug/seg/:encoded <span className="text-slate-500 font-sans">— Proxied video segment (TS/fMP4) with custom headers</span></p>
-                    <p className="text-emerald-400">GET /img/:encoded <span className="text-slate-500 font-sans">— Channel & event logo proxy</span></p>
                     <p className="text-emerald-400">GET /api/fancode/events <span className="text-slate-500 font-sans">— JSON event list for UI integration</span></p>
                   </div>
                 </TabsContent>

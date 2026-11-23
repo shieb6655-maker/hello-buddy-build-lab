@@ -7,7 +7,6 @@
  *   GET /fancode/<slug>/<quality>.m3u8     → proxy + rewrite HLS variant playlist
  *   GET /fancode/<slug>/seg/<encoded-ts>   → proxy TS/fMP4 segment
  *   GET /playlist.m3u8                     → master playlist, all events, clean slug URLs
- *   GET /img/<encoded-logo>                → logo image proxy
  *   GET /api/fancode/events                → JSON list of current events for UI
  *
  * Upstream headers:
@@ -323,10 +322,7 @@ export async function serveMasterPlaylist(workerUrl: URL): Promise<Response> {
     const line = raw.trimEnd();
 
     if (line.startsWith("#EXTINF:")) {
-      pendingExtinf = line.replace(
-        /tvg-logo="(https?:\/\/[^"]+)"/,
-        (_, logoUrl: string) => `tvg-logo="${base}/img/${b64e(logoUrl)}"`,
-      );
+      pendingExtinf = line;
       continue;
     }
 
@@ -436,36 +432,6 @@ export async function serveSegment(_slug: string, encodedSeg: string, request: R
   return new Response(upstream.body, { status: upstream.status, headers });
 }
 
-export async function serveLogo(encodedUrl: string): Promise<Response> {
-  let logoUrl: string;
-  try {
-    logoUrl = b64d(decodeURIComponent(encodedUrl));
-  } catch {
-    throw new HttpError(400, "Malformed logo URL encoding");
-  }
-
-  if (!logoUrl.includes("fancode.com")) {
-    throw new HttpError(403, "Logo not from fancode.com");
-  }
-
-  const upstream = await fetchWithRetry(logoUrl, {
-    headers: { "User-Agent": FANCODE_HEADERS["User-Agent"]! },
-  });
-
-  if (!upstream.ok) {
-    throw new HttpError(upstream.status, "Logo fetch failed");
-  }
-
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: {
-      "Content-Type": upstream.headers.get("Content-Type") || "image/jpeg",
-      "Cache-Control": "public, max-age=86400",
-      ...CORS_HEADERS,
-    },
-  });
-}
-
 export async function serveEventsJson(workerUrl: URL): Promise<Response> {
   const { events } = await fetchUpstreamPlaylist();
   const base = workerBase(workerUrl);
@@ -473,7 +439,6 @@ export async function serveEventsJson(workerUrl: URL): Promise<Response> {
   const enrichedEvents = events.map((e) => ({
     ...e,
     streamUrl: `${base}/fancode/${e.slug}/playlist.m3u8`,
-    proxyLogo: e.logo ? `${base}/img/${b64e(e.logo)}` : undefined,
   }));
 
   return jsonResponse({
@@ -504,9 +469,6 @@ Variant playlist:
 Segment (proxied with FanCode headers):
   GET /fancode/<event-id>/seg/<encoded>
 
-Logo image proxy:
-  GET /img/<encoded-logo-url>
-
 API endpoints:
   GET /api/fancode/events  → JSON list of live streams
 `.trim();
@@ -528,7 +490,6 @@ export async function handleFanCodeRequest(
     path === "/playlist.m3u8" ||
     path === "/playlist" ||
     path.startsWith("/fancode/") ||
-    path.startsWith("/img/") ||
     path.startsWith("/api/fancode");
 
   if (!isProxyPath) {
@@ -570,12 +531,6 @@ export async function handleFanCodeRequest(
     const segMatch = path.match(/^\/fancode\/([^/]+)\/seg\/(.+)$/);
     if (segMatch && segMatch[1] && segMatch[2]) {
       return await serveSegment(segMatch[1], segMatch[2], request);
-    }
-
-    // Logo proxy: /img/<base64-encoded-logo-url>
-    const logoMatch = path.match(/^\/img\/(.+)$/);
-    if (logoMatch && logoMatch[1]) {
-      return await serveLogo(logoMatch[1]);
     }
 
     return errorResponse(404, "Not found — see /playlist.m3u8 or /api/fancode/events");
