@@ -1,18 +1,6 @@
 /**
  * FanCode Stream Proxy — TypeScript Implementation
  * Clean URL routing: /fancode/<event-slug>/playlist.m3u8
- *
- * Routes:
- *   GET /fancode/<slug>/playlist.m3u8      → proxy + rewrite HLS master for that event
- *   GET /fancode/<slug>/<quality>.m3u8     → proxy + rewrite HLS variant playlist
- *   GET /fancode/<slug>/seg/<encoded-ts>   → proxy TS/fMP4 segment
- *   GET /playlist.m3u8                     → master playlist, all events, clean slug URLs
- *   GET /api/fancode/events                → JSON list of current events for UI
- *
- * Upstream headers:
- *   Referer:    https://www.fancode.com/
- *   Origin:     https://www.fancode.com
- *   User-Agent: Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 ...
  */
 
 export interface FanCodeEvent {
@@ -22,16 +10,25 @@ export interface FanCodeEvent {
   logo: string;
   streamUrl?: string;
   category?: string;
+  /** Per-event upstream headers parsed from the "|User-Agent=…&Referer=…" suffix */
+  upstreamHeaders?: Record<string, string>;
 }
 
 export const UPSTREAM_PLAYLIST = "https://premiumplugx.top/fcd/playlist.php";
-export const FANCODE_CDN_HOST = "in-mc-plive.fancode.com";
 
+/** FanCode serves HLS from several CDN sub-domains (vod, plive, …). */
+export const FANCODE_CDN_SUFFIX = ".fancode.com";
+
+/**
+ * Default upstream headers used for CDN requests.
+ * The UA/Referer values match what the premiumplugx playlist advertises,
+ * so the CDN accepts our requests even when no per-event headers are present.
+ */
 export const FANCODE_HEADERS: Record<string, string> = {
-  Referer: "https://www.fancode.com/",
-  Origin: "https://www.fancode.com",
+  Referer: "https://fancode.com/",
+  Origin: "https://fancode.com",
   "User-Agent":
-    "Mozilla/5.0 (Linux; Android 16; Pixel 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Mobile Safari/537.36",
+    "ReactNativeVideo/9.11.1 (Linux;Android 13) AndroidXMedia3/1.6.1",
 };
 
 export const CORS_HEADERS: Record<string, string> = {
@@ -111,6 +108,7 @@ export function resolveBase(url: string): string {
     const u = new URL(url);
     u.pathname = u.pathname.slice(0, u.pathname.lastIndexOf("/") + 1);
     u.search = "";
+    u.hash = "";
     return u.href;
   } catch {
     return url;
@@ -130,6 +128,16 @@ export function urlToSlug(streamUrl: string): string {
   return b64e(streamUrl).replace(/[^a-zA-Z0-9-_]/g, "").slice(0, 32);
 }
 
+/** Safety check: only allow FanCode CDN hosts to be proxied. */
+export function isFanCodeHost(url: string): boolean {
+  try {
+    const host = new URL(url).hostname;
+    return host === "fancode.com" || host.endsWith(FANCODE_CDN_SUFFIX);
+  } catch {
+    return false;
+  }
+}
+
 // ─── Upstream Fetch & Parse ──────────────────────────────────────────────────
 
 export async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 2): Promise<Response> {
@@ -145,6 +153,38 @@ export async function fetchWithRetry(url: string, options: RequestInit = {}, ret
     }
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/**
+ * FIX: The upstream playlist wraps each stream URL with a pipe suffix like:
+ *
+ *   https://…/index.m3u8|User-Agent=ReactNativeVideo/9.11.1 (Linux;Android 13) AndroidXMedia3/1.6.1&Referer=https://fancode.com/
+ *
+ * The old code assigned this whole string to `cdnUrl`, so every CDN fetch
+ * used a URL containing "|User-Agent=…" and failed. We now split on the pipe,
+ * keep the clean URL, and extract the headers separately.
+ */
+export function parseStreamLine(rawLine: string): { cdnUrl: string; headers: Record<string, string> } {
+  const line = rawLine.trim();
+  const pipe = line.indexOf("|");
+  if (pipe < 0) return { cdnUrl: line, headers: {} };
+
+  const cdnUrl = line.slice(0, pipe).trim();
+  const headerStr = line.slice(pipe + 1);
+  const headers: Record<string, string> = {};
+
+  // Headers are "Key=Value" separated by '&'. Values may themselves contain '&'
+  // (e.g. URLs inside Referer), so only split on '&' that is followed by "Name=".
+  const parts = headerStr.split(/&(?=[A-Za-z][A-Za-z0-9-]*=)/);
+  for (const part of parts) {
+    const eq = part.indexOf("=");
+    if (eq > 0) {
+      const key = part.slice(0, eq).trim();
+      const value = part.slice(eq + 1);
+      if (key) headers[key] = value;
+    }
+  }
+  return { cdnUrl, headers };
 }
 
 export function parsePlaylistEvents(text: string): FanCodeEvent[] {
@@ -169,7 +209,7 @@ export function parsePlaylistEvents(text: string): FanCodeEvent[] {
     }
 
     if (!line.startsWith("#") && line.startsWith("http")) {
-      const cdnUrl = line.trim();
+      const { cdnUrl, headers } = parseStreamLine(line);
       const slug = urlToSlug(cdnUrl);
       events.push({
         slug,
@@ -177,6 +217,7 @@ export function parsePlaylistEvents(text: string): FanCodeEvent[] {
         name: lastName || `FanCode Event ${slug}`,
         logo: lastLogo,
         category: lastCategory || "Sports",
+        upstreamHeaders: headers,
       });
       lastName = "";
       lastLogo = "";
@@ -195,14 +236,12 @@ export async function fetchUpstreamPlaylist(forceRefresh = false): Promise<{ tex
 
   const res = await fetchWithRetry(UPSTREAM_PLAYLIST, {
     headers: { ...FANCODE_HEADERS },
-    // Cloudflare edge cache hint if supported
     // @ts-expect-error CF specific fetch option
     cf: { cacheTtl: 60, cacheEverything: true },
   });
 
   if (!res.ok) {
     if (cachedPlaylist) {
-      // Fallback to stale cache if upstream is temporarily failing
       return { text: cachedPlaylist.text, events: cachedPlaylist.events };
     }
     throw new HttpError(502, `Upstream playlist HTTP ${res.status}`);
@@ -214,21 +253,25 @@ export async function fetchUpstreamPlaylist(forceRefresh = false): Promise<{ tex
   return { text, events };
 }
 
-export async function resolveCdnUrl(slug: string): Promise<string> {
+export async function resolveEvent(slug: string): Promise<FanCodeEvent> {
   const { events } = await fetchUpstreamPlaylist();
   const entry = events.find((e) => e.slug === slug);
-  if (!entry) {
-    throw new HttpError(404, `Event slug not found: ${slug}`);
-  }
-  return entry.cdnUrl;
+  if (!entry) throw new HttpError(404, `Event slug not found: ${slug}`);
+  return entry;
 }
 
-export async function cdnFetch(url: string, rangeHeader?: string | null): Promise<Response> {
-  const headers: Record<string, string> = { ...FANCODE_HEADERS };
-  if (rangeHeader) {
-    headers["Range"] = rangeHeader;
-  }
+export async function resolveCdnUrl(slug: string): Promise<string> {
+  return (await resolveEvent(slug)).cdnUrl;
+}
+
+export async function cdnFetch(
+  url: string,
+  opts: { method?: string; range?: string | null; extraHeaders?: Record<string, string> } = {},
+): Promise<Response> {
+  const headers: Record<string, string> = { ...FANCODE_HEADERS, ...(opts.extraHeaders || {}) };
+  if (opts.range) headers["Range"] = opts.range;
   return fetchWithRetry(url, {
+    method: opts.method || "GET",
     headers,
     // @ts-expect-error CF specific option
     cf: { cacheTtl: 0 },
@@ -237,6 +280,17 @@ export async function cdnFetch(url: string, rangeHeader?: string | null): Promis
 
 // ─── Manifest Rewriter ───────────────────────────────────────────────────────
 
+/**
+ * FIX: Previous code only rewrote `#EXT-X-KEY`, `#EXT-X-MEDIA` and
+ * `#EXT-X(STREAM|I-FRAME-STREAM)-INF`. That meant LL-HLS and fMP4
+ * streams broke because `#EXT-X-MAP`, `#EXT-X-PART`,
+ * `#EXT-X-PRELOAD-HINT`, `#EXT-X-SESSION-KEY` and
+ * `#EXT-X-RENDITION-REPORT` still pointed at the CDN directly.
+ *
+ * FIX: Variant playlists used to be flattened to their filename. That lost
+ * query strings and broke relative sub-directory layouts. They are now
+ * encoded as base64 (`/fancode/<slug>/v/<b64>.m3u8`), same idea as segments.
+ */
 export function rewriteManifest(
   text: string,
   baseUrl: string,
@@ -247,58 +301,47 @@ export function rewriteManifest(
   const lines = text.split("\n");
   const out: string[] = [];
 
+  const segProxy = (abs: string) =>
+    `${workerBaseUrl}/fancode/${slug}/seg/${b64e(abs)}`;
+  const varProxy = (abs: string) =>
+    `${workerBaseUrl}/fancode/${slug}/v/${b64e(abs)}.m3u8`;
+
+  const SEG_TAGS = [
+    "#EXT-X-KEY",
+    "#EXT-X-SESSION-KEY",
+    "#EXT-X-MAP",
+    "#EXT-X-PART",
+    "#EXT-X-PRELOAD-HINT",
+  ];
+  const VAR_TAGS = [
+    "#EXT-X-MEDIA",
+    "#EXT-X-I-FRAME-STREAM-INF",
+    "#EXT-X-RENDITION-REPORT",
+  ];
+
   for (const raw of lines) {
     const line = raw.trimEnd();
 
-    // EXT-X-KEY
-    if (line.startsWith("#EXT-X-KEY") && line.includes('URI="')) {
+    const isSegTag = SEG_TAGS.some((t) => line.startsWith(t) && line.includes('URI="'));
+    const isVarTag = VAR_TAGS.some((t) => line.startsWith(t) && line.includes('URI="'));
+    const isStreamInfUri = line.startsWith("#EXT-X-STREAM-INF") && line.includes('URI="');
+
+    if (isSegTag || isVarTag || isStreamInfUri) {
       out.push(
         line.replace(/URI="([^"]+)"/, (_, uri: string) => {
           const abs = resolveUrl(uri, baseUrl);
-          return `URI="${workerBaseUrl}/fancode/${slug}/seg/${encodeURIComponent(b64e(abs))}"`;
+          return `URI="${isSegTag ? segProxy(abs) : varProxy(abs)}"`;
         }),
       );
       continue;
     }
 
-    // EXT-X-MEDIA with URI
-    if (line.startsWith("#EXT-X-MEDIA") && line.includes('URI="')) {
-      out.push(
-        line.replace(/URI="([^"]+)"/, (_, uri: string) => {
-          const abs = resolveUrl(uri, baseUrl);
-          const file = abs.split("/").pop(); // e.g. audio.m3u8
-          return `URI="${workerBaseUrl}/fancode/${slug}/${file}"`;
-        }),
-      );
-      continue;
-    }
-
-    // EXT-X-STREAM-INF and EXT-X-I-FRAME-STREAM-INF with URI=
-    if (
-      (line.startsWith("#EXT-X-STREAM-INF") || line.startsWith("#EXT-X-I-FRAME-STREAM-INF")) &&
-      line.includes('URI="')
-    ) {
-      out.push(
-        line.replace(/URI="([^"]+)"/, (_, uri: string) => {
-          const abs = resolveUrl(uri, baseUrl);
-          const file = abs.split("/").pop()?.split("?")[0];
-          return `URI="${workerBaseUrl}/fancode/${slug}/${file}"`;
-        }),
-      );
-      continue;
-    }
-
-    // Non-comment, non-empty URI line
+    // Non-comment URI line (variant playlist reference for STREAM-INF,
+    // or a bare segment reference inside a media playlist).
     if (!line.startsWith("#") && line.trim() !== "") {
       const abs = resolveUrl(line.trim(), baseUrl);
-      const isPlaylist = abs.split("?")[0]?.endsWith(".m3u8");
-
-      if (isPlaylist) {
-        const file = abs.split("/").pop()?.split("?")[0];
-        out.push(`${workerBaseUrl}/fancode/${slug}/${file}`);
-      } else {
-        out.push(`${workerBaseUrl}/fancode/${slug}/seg/${encodeURIComponent(b64e(abs))}`);
-      }
+      const isPlaylist = /\.m3u8(?:$|[?#])/i.test(abs);
+      out.push(isPlaylist ? varProxy(abs) : segProxy(abs));
       continue;
     }
 
@@ -327,7 +370,8 @@ export async function serveMasterPlaylist(workerUrl: URL): Promise<Response> {
     }
 
     if (!line.startsWith("#") && line.startsWith("http")) {
-      const slug = urlToSlug(line);
+      const { cdnUrl } = parseStreamLine(line);
+      const slug = urlToSlug(cdnUrl);
       if (pendingExtinf) {
         out.push(pendingExtinf);
         pendingExtinf = null;
@@ -343,6 +387,9 @@ export async function serveMasterPlaylist(workerUrl: URL): Promise<Response> {
     out.push(line);
   }
 
+  // FIX: flush a dangling EXTINF so the last entry isn't dropped.
+  if (pendingExtinf) out.push(pendingExtinf);
+
   return new Response(out.join("\n"), {
     headers: {
       "Content-Type": "application/vnd.apple.mpegurl",
@@ -353,8 +400,13 @@ export async function serveMasterPlaylist(workerUrl: URL): Promise<Response> {
 }
 
 export async function serveEventMaster(slug: string, workerUrl: URL, request: Request): Promise<Response> {
-  const cdnMasterUrl = await resolveCdnUrl(slug);
-  const upstream = await cdnFetch(cdnMasterUrl, request.headers.get("Range"));
+  const event = await resolveEvent(slug);
+
+  // FIX: master playlists are text — no point forwarding Range.
+  const upstream = await cdnFetch(event.cdnUrl, {
+    method: "GET",
+    extraHeaders: event.upstreamHeaders,
+  });
 
   if (!upstream.ok && upstream.status !== 206) {
     throw new HttpError(upstream.status, "CDN master fetch failed");
@@ -362,57 +414,79 @@ export async function serveEventMaster(slug: string, workerUrl: URL, request: Re
 
   const text = await upstream.text();
   const base = workerBase(workerUrl);
-  const baseUrl = resolveBase(cdnMasterUrl);
+  const baseUrl = resolveBase(event.cdnUrl);
   const rewritten = rewriteManifest(text, baseUrl, base, slug, "master");
 
-  return new Response(rewritten, {
-    status: upstream.status,
-    headers: {
-      "Content-Type": "application/vnd.apple.mpegurl",
-      "Cache-Control": "no-store",
-      ...CORS_HEADERS,
-    },
-  });
+  const headers = {
+    "Content-Type": "application/vnd.apple.mpegurl",
+    "Cache-Control": "no-store",
+    ...CORS_HEADERS,
+  };
+
+  // FIX: always 200 for rewritten text (Content-Length differs from upstream).
+  // FIX: HEAD requests must not carry a body.
+  if (request.method === "HEAD") {
+    return new Response(null, { status: 200, headers });
+  }
+  return new Response(rewritten, { status: 200, headers });
 }
 
-export async function serveVariant(slug: string, qualityFile: string, workerUrl: URL, request: Request): Promise<Response> {
-  const cdnMasterUrl = await resolveCdnUrl(slug);
-  const baseUrl = resolveBase(cdnMasterUrl);
-  const cdnVariantUrl = baseUrl + qualityFile;
+export async function serveVariant(slug: string, encoded: string, request: Request): Promise<Response> {
+  // FIX: variant URLs are base64-encoded, preserving query strings and
+  // nested sub-directory layouts.
+  let cdnUrl: string;
+  try {
+    cdnUrl = b64d(encoded);
+  } catch {
+    throw new HttpError(400, "Malformed variant path encoding");
+  }
 
-  const upstream = await cdnFetch(cdnVariantUrl, request.headers.get("Range"));
+  if (!isFanCodeHost(cdnUrl)) {
+    throw new HttpError(403, "Variant not from fancode CDN");
+  }
+
+  const upstream = await cdnFetch(cdnUrl, { method: "GET" });
   if (!upstream.ok && upstream.status !== 206) {
     throw new HttpError(upstream.status, "CDN variant fetch failed");
   }
 
   const text = await upstream.text();
-  const base = workerBase(workerUrl);
+  const base = workerBase(new URL(request.url));
+  const baseUrl = resolveBase(cdnUrl);
   const rewritten = rewriteManifest(text, baseUrl, base, slug, "variant");
 
-  return new Response(rewritten, {
-    status: upstream.status,
-    headers: {
-      "Content-Type": "application/vnd.apple.mpegurl",
-      "Cache-Control": "no-store",
-      ...CORS_HEADERS,
-    },
-  });
+  const headers = {
+    "Content-Type": "application/vnd.apple.mpegurl",
+    "Cache-Control": "no-store",
+    ...CORS_HEADERS,
+  };
+
+  if (request.method === "HEAD") {
+    return new Response(null, { status: 200, headers });
+  }
+  return new Response(rewritten, { status: 200, headers });
 }
 
 export async function serveSegment(_slug: string, encodedSeg: string, request: Request): Promise<Response> {
   let segUrl: string;
   try {
-    segUrl = b64d(decodeURIComponent(encodedSeg));
+    segUrl = b64d(encodedSeg);
   } catch {
     throw new HttpError(400, "Malformed segment path encoding");
   }
 
-  if (!segUrl.includes(FANCODE_CDN_HOST)) {
+  // FIX: the previous check pinned the host to "in-mc-plive.fancode.com",
+  // which rejected all in-mc-vod.fancode.com segments. We now accept any
+  // *.fancode.com sub-domain.
+  if (!isFanCodeHost(segUrl)) {
     throw new HttpError(403, "Segment not from fancode CDN");
   }
 
-  const rangeHeader = request.headers.get("Range");
-  const upstream = await cdnFetch(segUrl, rangeHeader);
+  // FIX: forward HEAD as HEAD so Content-Length reflects the actual asset.
+  const upstream = await cdnFetch(segUrl, {
+    method: request.method,
+    range: request.headers.get("Range"),
+  });
 
   if (!upstream.ok && upstream.status !== 206) {
     throw new HttpError(upstream.status, "CDN segment fetch failed");
@@ -426,9 +500,13 @@ export async function serveSegment(_slug: string, encodedSeg: string, request: R
 
   const cl = upstream.headers.get("Content-Length");
   const cr = upstream.headers.get("Content-Range");
+  const ar = upstream.headers.get("Accept-Ranges");
   if (cl) headers["Content-Length"] = cl;
   if (cr) headers["Content-Range"] = cr;
+  if (ar) headers["Accept-Ranges"] = ar;
 
+  // For HEAD we still pass the body through — the CF runtime drops it when
+  // the client sent HEAD, and the Content-Length header was already copied.
   return new Response(upstream.body, { status: upstream.status, headers });
 }
 
@@ -437,7 +515,11 @@ export async function serveEventsJson(workerUrl: URL): Promise<Response> {
   const base = workerBase(workerUrl);
 
   const enrichedEvents = events.map((e) => ({
-    ...e,
+    slug: e.slug,
+    name: e.name,
+    logo: e.logo,
+    category: e.category,
+    cdnUrl: e.cdnUrl,
     streamUrl: `${base}/fancode/${e.slug}/playlist.m3u8`,
   }));
 
@@ -462,17 +544,13 @@ Per-event HLS master:
   GET /fancode/<event-id>/playlist.m3u8
   e.g. /fancode/4251136/playlist.m3u8
 
-Variant playlist:
-  GET /fancode/<event-id>/1080p.m3u8
-  GET /fancode/<event-id>/720p.m3u8
+Variant playlist (base64-encoded CDN path, .m3u8 suffix for MIME hint):
+  GET /fancode/<event-id>/v/<base64>.m3u8
 
 Segment proxy:
-  GET /fancode/<event-id>/seg/<encoded>
+  GET /fancode/<event-id>/seg/<base64>
 `.trim();
 
-/**
- * Handles incoming request. Returns Response if matched, or null if unhandled.
- */
 export async function handleFanCodeRequest(
   request: Request,
   _env?: unknown,
@@ -482,16 +560,13 @@ export async function handleFanCodeRequest(
   const path = url.pathname.replace(/\/+$/, "") || "/";
   const method = request.method.toUpperCase();
 
-  // Fast check: does this path belong to the proxy?
   const isProxyPath =
     path === "/playlist.m3u8" ||
     path === "/playlist" ||
     path.startsWith("/fancode/") ||
     path.startsWith("/api/fancode");
 
-  if (!isProxyPath) {
-    return null; // Let standard SSR / app router handle it
-  }
+  if (!isProxyPath) return null;
 
   if (method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -502,29 +577,26 @@ export async function handleFanCodeRequest(
   }
 
   try {
-    // Master playlist
     if (path === "/playlist.m3u8" || path === "/playlist") {
       return await serveMasterPlaylist(url);
     }
 
-    // JSON API for frontend
     if (path === "/api/fancode/events" || path === "/api/fancode") {
       return await serveEventsJson(url);
     }
 
-    // Per-event HLS master: /fancode/<slug>/playlist.m3u8
     const eventMasterMatch = path.match(/^\/fancode\/([^/]+)\/playlist\.m3u8$/);
     if (eventMasterMatch && eventMasterMatch[1]) {
       return await serveEventMaster(eventMasterMatch[1], url, request);
     }
 
-    // Variant playlist: /fancode/<slug>/<quality>.m3u8
-    const variantMatch = path.match(/^\/fancode\/([^/]+)\/([^/]+\.m3u8)$/);
+    // Variant: /fancode/<slug>/v/<b64>.m3u8
+    const variantMatch = path.match(/^\/fancode\/([^/]+)\/v\/(.+)\.m3u8$/);
     if (variantMatch && variantMatch[1] && variantMatch[2]) {
-      return await serveVariant(variantMatch[1], variantMatch[2], url, request);
+      return await serveVariant(variantMatch[1], variantMatch[2], request);
     }
 
-    // Segment: /fancode/<slug>/seg/<base64-encoded-segment-path>
+    // Segment: /fancode/<slug>/seg/<b64>
     const segMatch = path.match(/^\/fancode\/([^/]+)\/seg\/(.+)$/);
     if (segMatch && segMatch[1] && segMatch[2]) {
       return await serveSegment(segMatch[1], segMatch[2], request);
