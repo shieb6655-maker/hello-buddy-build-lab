@@ -24,7 +24,7 @@ export interface FanCodeEvent {
   category?: string;
 }
 
-export const UPSTREAM_PLAYLIST = "https://premiumplugx.top/fancodeapio/playlist.php";
+export const UPSTREAM_PLAYLIST = "https://premiumplugx.top/fcd/playlist.php";
 export const FANCODE_CDN_HOST = "in-mc-plive.fancode.com";
 
 export const FANCODE_HEADERS: Record<string, string> = {
